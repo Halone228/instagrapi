@@ -1,6 +1,6 @@
 from copy import deepcopy
 from json.decoder import JSONDecodeError
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Generator
 
 from instagrapi.exceptions import (
     ClientError,
@@ -465,7 +465,7 @@ class UserMixin:
         """
         return self.search_following_v1(user_id, query)
 
-    def user_following_gql(self, user_id: str, amount: int = 0) -> List[UserShort]:
+    def user_following_gql(self, user_id: str, amount: int = 0) -> Generator[UserShort]:
         """
         Get user's following users information by Public Graphql API
 
@@ -491,7 +491,9 @@ class UserMixin:
             "first": 24,
         }
         self.inject_sessionid_to_public()
-        while True:
+        cnt = 0
+        is_running = True
+        while is_running:
             if end_cursor:
                 variables["after"] = end_cursor
             data = self.public_graphql_request(
@@ -502,20 +504,20 @@ class UserMixin:
             page_info = json_value(data, "user", "edge_follow", "page_info", default={})
             edges = json_value(data, "user", "edge_follow", "edges", default=[])
             for edge in edges:
-                users.append(extract_user_short(edge["node"]))
+                # While less than amount, yielding result
+                if cnt == amount and amount:
+                    is_running = False
+                    break
+                yield extract_user_short(edge["node"])
             end_cursor = page_info.get("end_cursor")
             if not page_info.get("has_next_page") or not end_cursor:
                 break
             if amount and len(users) >= amount:
                 break
-            # time.sleep(sleep)
-        if amount:
-            users = users[:amount]
-        return users
 
     def user_following_v1_chunk(
         self, user_id: str, max_amount: int = 0, max_id: str = ""
-    ) -> Tuple[List[UserShort], str]:
+    ) -> Generator[List[UserShort], str]:
         """
         Get user's following users information by Private Mobile API and max_id (cursor)
 
@@ -534,7 +536,7 @@ class UserMixin:
             Tuple of List of users and max_id
         """
         unique_set = set()
-        users = []
+        cnt = 0
         while True:
             result = self.private_request(
                 f"friendships/{user_id}/following/",
@@ -547,18 +549,23 @@ class UserMixin:
                     "enable_groups": "true",
                 },
             )
-            for user in result["users"]:
-                user = extract_user_short(user)
-                if user.pk in unique_set:
-                    continue
-                unique_set.add(user.pk)
-                users.append(user)
-            max_id = result.get("next_max_id")
-            if not max_id or (max_amount and len(users) >= max_amount):
-                break
-        return users, max_id
 
-    def user_following_v1(self, user_id: str, amount: int = 0) -> List[UserShort]:
+            def process_raw_user(raw_user):
+                user = extract_user_short(raw_user)
+                if user.pl in unique_set:
+                    return
+                unique_set.add(user.pk)
+                return user
+
+            user_chunk = list((i for i in map(process_raw_user, result["users"]) if i is not None))
+            cnt += len(user_chunk)
+            max_id = result.get("next_max_id")
+            # Returning `UserShort` chunk and max_id of the next chunk
+            yield user_chunk, max_id
+            if not max_id or (max_amount and cnt >= max_amount):
+                break
+
+    def user_following_v1(self, user_id: str, amount: int = 0) -> Generator[UserShort]:
         """
         Get user's following users formation by Private Mobile API
 
@@ -574,10 +581,13 @@ class UserMixin:
         List[UserShort]
             List of objects of User type
         """
-        users, _ = self.user_following_v1_chunk(str(user_id), amount)
-        if amount:
-            users = users[:amount]
-        return users
+        cnt = 0
+        for users, _ in self.user_following_v1_chunk(str(user_id), amount):
+            for user in users:
+                if cnt >= amount:
+                    break
+                cnt += 1
+                yield user
 
     def user_following(
         self, user_id: str, use_cache: bool = True, amount: int = 0
@@ -619,7 +629,7 @@ class UserMixin:
 
     def user_followers_gql_chunk(
         self, user_id: str, max_amount: int = 0, end_cursor: str = None
-    ) -> Tuple[List[UserShort], str]:
+    ) -> Generator[List[UserShort], str]:
         """
         Get user's followers information by Public Graphql API and end_cursor
 
@@ -646,6 +656,7 @@ class UserMixin:
             "first": 12,
         }
         self.inject_sessionid_to_public()
+        cnt = 0
         while True:
             if end_cursor:
                 variables["after"] = end_cursor
@@ -658,16 +669,17 @@ class UserMixin:
                 data, "user", "edge_followed_by", "page_info", default={}
             )
             edges = json_value(data, "user", "edge_followed_by", "edges", default=[])
-            for edge in edges:
-                users.append(extract_user_short(edge["node"]))
-            end_cursor = page_info.get("end_cursor")
+            end_cursor = page_info.get("end_cursor", "")
+            users = [extract_user_short(user) for user in edges]
+            cnt += len(users)
+            yield users, end_cursor
             if not page_info.get("has_next_page") or not end_cursor:
                 break
-            if max_amount and len(users) >= max_amount:
+            if max_amount and cnt >= max_amount:
                 break
         return users, end_cursor
 
-    def user_followers_gql(self, user_id: str, amount: int = 0) -> List[UserShort]:
+    def user_followers_gql(self, user_id: str, amount: int = 0) -> Generator[UserShort]:
         """
         Get user's followers information by Public Graphql API
 
@@ -683,14 +695,17 @@ class UserMixin:
         List[UserShort]
             List of objects of User type
         """
-        users, _ = self.user_followers_gql_chunk(str(user_id), amount)
-        if amount:
-            users = users[:amount]
-        return users
+        cnt = 0
+        for users, _ in self.user_followers_gql_chunk(str(user_id), amount):
+            for user in users:
+                if cnt >= amount:
+                    return
+                cnt += 1
+                yield user
 
     def user_followers_v1_chunk(
         self, user_id: str, max_amount: int = 0, max_id: str = ""
-    ) -> Tuple[List[UserShort], str]:
+    ) -> Generator[List[UserShort], str]:
         """
         Get user's followers information by Private Mobile API and max_id (cursor)
 
@@ -710,6 +725,7 @@ class UserMixin:
         """
         unique_set = set()
         users = []
+        cnt = 0
         while True:
             result = self.private_request(
                 f"friendships/{user_id}/followers/",
@@ -722,18 +738,23 @@ class UserMixin:
                     "enable_groups": "true",
                 },
             )
-            for user in result["users"]:
-                user = extract_user_short(user)
-                if user.pk in unique_set:
-                    continue
-                unique_set.add(user.pk)
-                users.append(user)
-            max_id = result.get("next_max_id")
-            if not max_id or (max_amount and len(users) >= max_amount):
-                break
-        return users, max_id
 
-    def user_followers_v1(self, user_id: str, amount: int = 0) -> List[UserShort]:
+            def process_raw_user(raw_user):
+                user = extract_user_short(raw_user)
+                if user.pl in unique_set:
+                    return
+                unique_set.add(user.pk)
+                return user
+
+            user_chunk = list((i for i in map(process_raw_user, result["users"]) if i is not None))
+            cnt += len(user_chunk)
+            max_id = result.get("next_max_id")
+            # Returning `UserShort` chunk and max_id of the next chunk
+            yield user_chunk, max_id
+            if not max_id or (max_amount and cnt >= max_amount):
+                break
+
+    def user_followers_v1(self, user_id: str, amount: int = 0) -> Generator[UserShort]:
         """
         Get user's followers information by Private Mobile API
 
@@ -749,10 +770,13 @@ class UserMixin:
         List[UserShort]
             List of objects of User type
         """
-        users, _ = self.user_followers_v1_chunk(str(user_id), amount)
-        if amount:
-            users = users[:amount]
-        return users
+        cnt = 0
+        for users, _ in self.user_followers_gql_chunk(str(user_id), amount):
+            for user in users:
+                if cnt >= amount:
+                    return
+                cnt += 1
+                yield user
 
     def user_followers(
         self, user_id: str, use_cache: bool = True, amount: int = 0
